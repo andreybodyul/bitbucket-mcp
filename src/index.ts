@@ -18,6 +18,34 @@ import {
   BITBUCKET_DEFAULT_PAGELEN,
   BITBUCKET_MAX_PAGELEN,
 } from "./pagination.js";
+import {
+  type ApiVariant,
+  detectVariant,
+  normalizeBaseUrl,
+  repoBase as adapterRepoBase,
+  prList as adapterPrList,
+  prBase as adapterPrBase,
+  prComments as adapterPrComments,
+  prComment as adapterPrComment,
+  prApprove as adapterPrApprove,
+  prMerge as adapterPrMerge,
+  prDecline as adapterPrDecline,
+  prActivity as adapterPrActivity,
+  prCommits as adapterPrCommits,
+  prDiff as adapterPrDiff,
+  prChanges as adapterPrChanges,
+  prTasks as adapterPrTasks,
+  prStatuses as adapterPrStatuses,
+  prPatch as adapterPrPatch,
+  repoBranchingModel as adapterRepoBranchingModel,
+  repoEffectiveBranchingModel as adapterRepoEffectiveBranchingModel,
+  repoDefaultReviewers as adapterRepoDefaultReviewers,
+  CLOUD_ONLY_TOOLS,
+  buildCreatePRBody,
+  buildCommentBody,
+  buildUpdateCommentBody,
+  buildMergeBody,
+} from "./api-adapter.js";
 
 // =========== LOGGER SETUP ==========
 // File-based logging with sensible defaults and ability to disable
@@ -475,6 +503,7 @@ class BitbucketServer {
   private readonly api: AxiosInstance;
   private readonly config: BitbucketConfig;
   private readonly paginator: BitbucketPaginator;
+  private readonly variant: ApiVariant;
   private readonly dangerousToolNames = new Set<string>([
     "deletePullRequestComment",
     "deletePullRequestTask",
@@ -509,7 +538,14 @@ class BitbucketServer {
       defaultWorkspace: process.env.BITBUCKET_WORKSPACE,
     };
 
+    this.variant = detectVariant(initialConfig.baseUrl);
+
     const normalizedConfig = normalizeBitbucketConfig(initialConfig);
+    // For Server variant, ensure /rest/api/1.0 is appended
+    normalizedConfig.baseUrl = normalizeBaseUrl(
+      normalizedConfig.baseUrl,
+      this.variant
+    );
 
     if (
       normalizedConfig.baseUrl !== initialConfig.baseUrl ||
@@ -519,6 +555,7 @@ class BitbucketServer {
         fromBaseUrl: initialConfig.baseUrl,
         toBaseUrl: normalizedConfig.baseUrl,
         defaultWorkspace: normalizedConfig.defaultWorkspace,
+        variant: this.variant,
       });
     }
 
@@ -561,7 +598,7 @@ class BitbucketServer {
           : undefined,
     });
 
-    this.paginator = new BitbucketPaginator(this.api, logger);
+    this.paginator = new BitbucketPaginator(this.api, logger, this.variant);
 
     // Setup tool handlers using the request handler pattern
     this.setupToolHandlers();
@@ -1856,8 +1893,9 @@ class BitbucketServer {
         },
       ].filter(
         (tool) =>
-          this.config.allowDangerousCommands === true ||
-          !this.isDangerousTool(tool.name)
+          (this.config.allowDangerousCommands === true ||
+            !this.isDangerousTool(tool.name)) &&
+          (this.variant === "cloud" || !CLOUD_ONLY_TOOLS.has(tool.name))
       ),
     }));
 
@@ -1878,6 +1916,14 @@ class BitbucketServer {
           throw new McpError(
             ErrorCode.MethodNotFound,
             `Tool ${toolName} is disabled. Set BITBUCKET_ENABLE_DANGEROUS=true to enable.`
+          );
+        }
+
+        // Guard Cloud-only tools on Server
+        if (this.variant === "server" && CLOUD_ONLY_TOOLS.has(toolName)) {
+          throw new McpError(
+            ErrorCode.MethodNotFound,
+            `Tool ${toolName} is not available on Bitbucket Server/Data Center.`
           );
         }
 
@@ -2310,11 +2356,20 @@ class BitbucketServer {
 
       const params: Record<string, any> = {};
       if (name) {
-        params.q = `name~"${name}"`;
+        if (this.variant === "cloud") {
+          params.q = `name~"${name}"`;
+        } else {
+          params.name = name;
+        }
       }
 
+      const repoPath =
+        this.variant === "cloud"
+          ? `/repositories/${wsName}`
+          : `/projects/${wsName}/repos`;
+
       const repositories = await this.paginator.fetchValues<BitbucketRepository>(
-        `/repositories/${wsName}`,
+        repoPath,
         {
           pagelen: pagelen ?? legacyLimit,
           page,
@@ -2351,7 +2406,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}`
+        adapterRepoBase(this.variant, workspace, repo_slug)
       );
 
       return {
@@ -2381,7 +2436,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/effective-default-reviewers`
+        adapterRepoDefaultReviewers(this.variant, workspace, repo_slug)
       );
 
       return {
@@ -2432,7 +2487,7 @@ class BitbucketServer {
       }
 
       const result = await this.paginator.fetchValues<BitbucketPullRequest>(
-        `/repositories/${workspace}/${repo_slug}/pullrequests`,
+        adapterPrList(this.variant, workspace, repo_slug),
         {
           pagelen: pagelen ?? legacyLimit,
           page,
@@ -2484,52 +2539,19 @@ class BitbucketServer {
         targetBranch,
       });
 
-      // Prepare reviewers format if provided
-      // Bitbucket API expects reviewers as array of objects: [{uuid: "{...}"}]
-      // Input is string array of UUIDs: ["{04776764-62c7-453b-b97e-302f60395ceb}", ...]
-      // Convert to API format: [{uuid: "{...}"}, ...]
-      let reviewersArray: Array<{ uuid: string }> | undefined;
-
-      if (reviewers && reviewers.length > 0) {
-        reviewersArray = reviewers
-          .filter((uuid) => typeof uuid === "string" && uuid.trim().length > 0)
-          .map((uuid) => ({ uuid: uuid.trim() }));
-
-        if (reviewersArray.length === 0) {
-          reviewersArray = undefined;
-        }
-      }
-
-      // Build request payload - only include reviewers if provided
-      const requestPayload: Record<string, any> = {
+      const requestPayload = buildCreatePRBody(this.variant, {
+        workspace,
+        repoSlug: repo_slug,
         title,
         description,
-        source: {
-          branch: {
-            name: sourceBranch,
-          },
-        },
-        destination: {
-          branch: {
-            name: targetBranch,
-          },
-        },
-        close_source_branch: true,
-      };
+        sourceBranch,
+        targetBranch,
+        reviewers,
+        draft,
+      });
 
-      // Only include reviewers field if there are reviewers to add
-      if (reviewersArray && reviewersArray.length > 0) {
-        requestPayload.reviewers = reviewersArray;
-      }
-
-      // Only include draft field if explicitly set to true
-      if (draft === true) {
-        requestPayload.draft = true;
-      }
-
-      // Create the pull request
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests`,
+        adapterPrList(this.variant, workspace, repo_slug),
         requestPayload
       );
 
@@ -2569,7 +2591,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`
+        adapterPrBase(this.variant, workspace, repo_slug, pull_request_id)
       );
 
       return {
@@ -2616,7 +2638,7 @@ class BitbucketServer {
       if (description !== undefined) updateData.description = description;
 
       const response = await this.api.put(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`,
+        adapterPrBase(this.variant, workspace, repo_slug, pull_request_id),
         updateData
       );
 
@@ -2663,7 +2685,7 @@ class BitbucketServer {
       });
 
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/activity`,
+        adapterPrActivity(this.variant, workspace, repo_slug, pull_request_id),
         {
           pagelen,
           page,
@@ -2709,7 +2731,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/approve`
+        adapterPrApprove(this.variant, workspace, repo_slug, pull_request_id)
       );
 
       return {
@@ -2749,7 +2771,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.delete(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/approve`
+        adapterPrApprove(this.variant, workspace, repo_slug, pull_request_id)
       );
 
       return {
@@ -2793,7 +2815,7 @@ class BitbucketServer {
       const data = message ? { message } : {};
 
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/decline`,
+        adapterPrDecline(this.variant, workspace, repo_slug, pull_request_id),
         data
       );
 
@@ -2836,13 +2858,19 @@ class BitbucketServer {
         strategy,
       });
 
-      // Build request data
-      const data: Record<string, any> = {};
-      if (message) data.message = message;
-      if (strategy) data.merge_strategy = strategy;
+      // For Server, we need the PR version for optimistic locking
+      let version: number | undefined;
+      if (this.variant === "server") {
+        const prResponse = await this.api.get(
+          adapterPrBase(this.variant, workspace, repo_slug, pull_request_id)
+        );
+        version = prResponse.data?.version;
+      }
+
+      const data = buildMergeBody(this.variant, { message, strategy, version });
 
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/merge`,
+        adapterPrMerge(this.variant, workspace, repo_slug, pull_request_id),
         data
       );
 
@@ -2889,7 +2917,7 @@ class BitbucketServer {
       });
 
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
+        adapterPrComments(this.variant, workspace, repo_slug, pull_request_id),
         {
           pagelen,
           page,
@@ -2934,24 +2962,27 @@ class BitbucketServer {
         pull_request_id,
       });
 
-      // First get the pull request details to extract commit information
-      const prResponse = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}`
-      );
+      let diffUrl: string;
 
-      const sourceCommit = prResponse.data.source.commit.hash;
-      const destinationCommit = prResponse.data.destination.commit.hash;
-
-      // Construct the correct diff URL with the proper format
-      // The format is: /repositories/{workspace}/{repo_slug}/diff/{source_repo}:{source_commit}%0D{destination_commit}?from_pullrequest_id={pr_id}&topic=true
-      const diffUrl = `/repositories/${workspace}/${repo_slug}/diff/${workspace}/${repo_slug}:${sourceCommit}%0D${destinationCommit}?from_pullrequest_id=${pull_request_id}&topic=true`;
+      if (this.variant === "server") {
+        // Server has a simple diff endpoint on the PR itself
+        diffUrl = adapterPrDiff(this.variant, workspace, repo_slug, pull_request_id);
+      } else {
+        // Cloud: construct complex diff URL using commit hashes
+        const prResponse = await this.api.get(
+          adapterPrBase(this.variant, workspace, repo_slug, pull_request_id)
+        );
+        const sourceCommit = prResponse.data.source.commit.hash;
+        const destinationCommit = prResponse.data.destination.commit.hash;
+        diffUrl = `/repositories/${workspace}/${repo_slug}/diff/${workspace}/${repo_slug}:${sourceCommit}%0D${destinationCommit}?from_pullrequest_id=${pull_request_id}&topic=true`;
+      }
 
       const response = await this.api.get(diffUrl, {
         headers: {
           Accept: "text/plain",
         },
         responseType: "text",
-        maxRedirects: 5, // Enable redirect following
+        maxRedirects: 5,
       });
 
       return {
@@ -2997,7 +3028,7 @@ class BitbucketServer {
       });
 
       const result = await this.paginator.fetchValues(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/commits`,
+        adapterPrCommits(this.variant, workspace, repo_slug, pull_request_id),
         {
           pagelen,
           page,
@@ -3046,35 +3077,20 @@ class BitbucketServer {
         inline: inline ? "inline comment" : "general comment",
       });
 
-      // Prepare the comment data
-      const commentData: any = {
-        content: {
-          raw: content,
-        },
-      };
-
-      // Add pending flag if provided
-      if (pending !== undefined) {
-        commentData.pending = pending;
-      }
-
-      // Add inline information if provided
-      if (inline) {
-        commentData.inline = {
-          path: inline.path,
-        };
-
-        // Add line number information based on the type
-        if (inline.from !== undefined) {
-          commentData.inline.from = inline.from;
-        }
-        if (inline.to !== undefined) {
-          commentData.inline.to = inline.to;
-        }
-      }
+      const commentData = buildCommentBody(this.variant, {
+        content,
+        inline: inline
+          ? {
+              path: inline.path,
+              from: inline.from,
+              to: inline.to,
+            }
+          : undefined,
+        pending,
+      });
 
       const response = await this.api.post(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments`,
+        adapterPrComments(this.variant, workspace, repo_slug, pull_request_id),
         commentData
       );
 
@@ -3110,7 +3126,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/branching-model`
+        adapterRepoBranchingModel(this.variant, workspace, repo_slug)
       );
 
       return {
@@ -3234,7 +3250,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/effective-branching-model`
+        adapterRepoEffectiveBranchingModel(this.variant, workspace, repo_slug)
       );
 
       return {
@@ -4338,7 +4354,7 @@ class BitbucketServer {
       });
 
       const response = await this.api.get(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`
+        adapterPrComment(this.variant, workspace, repo_slug, pull_request_id, comment_id)
       );
 
       return {
@@ -4381,11 +4397,10 @@ class BitbucketServer {
         comment_id,
       });
 
+      const updateBody = buildUpdateCommentBody(this.variant, content);
       const response = await this.api.put(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`,
-        {
-          content: { raw: content },
-        }
+        adapterPrComment(this.variant, workspace, repo_slug, pull_request_id, comment_id),
+        updateBody
       );
 
       return {
@@ -4425,7 +4440,7 @@ class BitbucketServer {
       });
 
       await this.api.delete(
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${comment_id}`
+        adapterPrComment(this.variant, workspace, repo_slug, pull_request_id, comment_id)
       );
 
       return {
@@ -4465,7 +4480,7 @@ class BitbucketServer {
       });
 
       const commentUrl = (id: string) =>
-        `/repositories/${workspace}/${repo_slug}/pullrequests/${pull_request_id}/comments/${id}`;
+        adapterPrComment(this.variant, workspace, repo_slug, pull_request_id, id);
       const resolveUrl = (id: string) => `${commentUrl(id)}/resolve`;
 
       // Bitbucket resolves comment *threads*, and the API expects the thread root comment ID.

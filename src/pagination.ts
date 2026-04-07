@@ -1,5 +1,6 @@
 import type { AxiosInstance } from "axios";
 import type winston from "winston";
+import type { ApiVariant } from "./api-adapter.js";
 
 export const BITBUCKET_DEFAULT_PAGELEN = 10;
 export const BITBUCKET_MAX_PAGELEN = 100;
@@ -33,7 +34,8 @@ interface PendingRequestConfig {
 export class BitbucketPaginator {
   constructor(
     private readonly api: AxiosInstance,
-    private readonly logger: winston.Logger
+    private readonly logger: winston.Logger,
+    private readonly variant: ApiVariant = "cloud"
   ) {}
 
   async fetchValues<T>(
@@ -53,13 +55,11 @@ export class BitbucketPaginator {
     const resolvedPagelen = this.normalizePagelen(
       pagelen ?? defaultPagelen
     );
+
     const requestParams: Record<string, any> = {
       ...params,
-      pagelen: resolvedPagelen,
+      ...this.buildPaginationParams(resolvedPagelen, page),
     };
-    if (page !== undefined) {
-      requestParams.page = page;
-    }
 
     const shouldFetchAll = all === true && page === undefined;
     const requestDescriptor: PendingRequestConfig = {
@@ -76,7 +76,7 @@ export class BitbucketPaginator {
       return {
         values,
         page: response.data?.page ?? page,
-        pagelen: response.data?.pagelen ?? resolvedPagelen,
+        pagelen: response.data?.pagelen ?? response.data?.limit ?? resolvedPagelen,
         next: response.data?.next,
         previous: response.data?.previous,
         fetchedPages: 1,
@@ -101,8 +101,8 @@ export class BitbucketPaginator {
 
       if (fetchedPages === 1) {
         firstPageMeta = {
-          page: response.data?.page,
-          pagelen: response.data?.pagelen ?? resolvedPagelen,
+          page: response.data?.page ?? response.data?.start,
+          pagelen: response.data?.pagelen ?? response.data?.limit ?? resolvedPagelen,
           previous: response.data?.previous,
         };
       }
@@ -110,7 +110,9 @@ export class BitbucketPaginator {
       const values = this.extractValues<T>(response.data);
       aggregated.push(...values);
 
-      if (!response.data?.next) {
+      // Check if there are more pages
+      const hasMore = this.hasMorePages(response.data);
+      if (!hasMore) {
         nextRequest = undefined;
         break;
       }
@@ -126,12 +128,11 @@ export class BitbucketPaginator {
 
       this.logger.debug("Following Bitbucket pagination next link", {
         description: description ?? path,
-        next: response.data.next,
         fetchedPages,
         totalFetched: aggregated.length,
       });
 
-      nextRequest = { url: response.data.next };
+      nextRequest = this.buildNextRequest(response.data, path, resolvedPagelen);
     }
 
     if (aggregated.length > maxItems) {
@@ -146,6 +147,53 @@ export class BitbucketPaginator {
       fetchedPages,
       totalFetched: aggregated.length,
     };
+  }
+
+  private buildPaginationParams(
+    pagelen: number,
+    page?: number
+  ): Record<string, any> {
+    if (this.variant === "server") {
+      const params: Record<string, any> = { limit: pagelen };
+      if (page !== undefined) {
+        params.start = (page - 1) * pagelen;
+      }
+      return params;
+    }
+    // Cloud
+    const params: Record<string, any> = { pagelen };
+    if (page !== undefined) {
+      params.page = page;
+    }
+    return params;
+  }
+
+  private hasMorePages(data: any): boolean {
+    if (this.variant === "server") {
+      return data?.isLastPage === false;
+    }
+    return !!data?.next;
+  }
+
+  private buildNextRequest(
+    data: any,
+    originalPath: string,
+    pagelen: number
+  ): PendingRequestConfig | undefined {
+    if (this.variant === "server") {
+      if (data?.isLastPage === false && data?.nextPageStart !== undefined) {
+        return {
+          url: originalPath,
+          params: { limit: pagelen, start: data.nextPageStart },
+        };
+      }
+      return undefined;
+    }
+    // Cloud — follow the next URL
+    if (data?.next) {
+      return { url: data.next };
+    }
+    return undefined;
   }
 
   private async performRequest(
